@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -84,4 +85,11 @@ func TestGobError(t *testing.T) {
 	client.Close()
 
 	listen.Close()
+}
+
+
+func BenchmarkRuntimeError(t *testing.B){
+	pc,file,_,_:=runtime.Caller(1)
+	fmt.Println("pc:"+string(pc))
+	fmt.Println("file:"+file)
 }
