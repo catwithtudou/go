@@ -27,11 +27,11 @@ var ErrShutdown = errors.New("connection is shut down")
 
 // Call represents an active RPC.
 type Call struct {
-	ServiceMethod string      // The name of the service and method to call.
-	Args          interface{} // The argument to the function (*struct).
-	Reply         interface{} // The reply from the function (*struct).
+	ServiceMethod string      // The name of the service and method to call. 服务提供的方法名称
+	Args          interface{} // The argument to the function (*struct). 入参
+	Reply         interface{} // The reply from the function (*struct). 出参
 	Error         error       // After completion, the error status.
-	Done          chan *Call  // Receives *Call when Go is complete.
+	Done          chan *Call  // Receives *Call when Go is complete. 保存已经完成了的Caller
 }
 
 // Client represents an RPC Client.
@@ -39,14 +39,14 @@ type Call struct {
 // with a single Client, and a Client may be used by
 // multiple goroutines simultaneously.
 type Client struct {
-	codec ClientCodec
+	codec ClientCodec //处理RPC调用请求返回的接口方法
 
 	reqMutex sync.Mutex // protects following
 	request  Request
 
 	mutex    sync.Mutex // protects following
 	seq      uint64
-	pending  map[uint64]*Call
+	pending  map[uint64]*Call //map[seq]*Handler
 	closing  bool // user has called Close
 	shutdown bool // server has told us to stop
 }
@@ -69,10 +69,12 @@ type ClientCodec interface {
 }
 
 func (client *Client) send(call *Call) {
+	//请求线程安全处理
 	client.reqMutex.Lock()
 	defer client.reqMutex.Unlock()
 
 	// Register this call.
+	// 注册线程安全处理
 	client.mutex.Lock()
 	if client.shutdown || client.closing {
 		client.mutex.Unlock()
@@ -86,21 +88,25 @@ func (client *Client) send(call *Call) {
 	client.mutex.Unlock()
 
 	// Encode and send the request.
+	// 请求进行编码之后发送
 	client.request.Seq = seq
 	client.request.ServiceMethod = call.ServiceMethod
 	err := client.codec.WriteRequest(&client.request, call.Args)
 	if err != nil {
 		client.mutex.Lock()
+		//若失败则删除该seq的Caller
 		call = client.pending[seq]
 		delete(client.pending, seq)
 		client.mutex.Unlock()
 		if call != nil {
 			call.Error = err
+			//释放该seq的Caller
 			call.done()
 		}
 	}
 }
 
+//循环接收response且若出现错误则终结掉所有call
 func (client *Client) input() {
 	var err error
 	var response Response
@@ -112,6 +118,7 @@ func (client *Client) input() {
 		}
 		seq := response.Seq
 		client.mutex.Lock()
+		//获取该response的seq的Caller并删除
 		call := client.pending[seq]
 		delete(client.pending, seq)
 		client.mutex.Unlock()
@@ -136,6 +143,7 @@ func (client *Client) input() {
 			if err != nil {
 				err = errors.New("reading error body: " + err.Error())
 			}
+			//释放该seq的Caller
 			call.done()
 		default:
 			err = client.codec.ReadResponseBody(call.Reply)
@@ -157,12 +165,14 @@ func (client *Client) input() {
 			err = io.ErrUnexpectedEOF
 		}
 	}
+	//释放client中pending的caller并将错误信息返回
 	for _, call := range client.pending {
 		call.Error = err
 		call.done()
 	}
 	client.mutex.Unlock()
 	client.reqMutex.Unlock()
+	//debugLog若开启则打印内部及I/O错误信息日志
 	if debugLog && err != io.EOF && !closing {
 		log.Println("rpc: client protocol error:", err)
 	}
@@ -192,6 +202,7 @@ func (call *Call) done() {
 // concurrent reads or concurrent writes.
 func NewClient(conn io.ReadWriteCloser) *Client {
 	encBuf := bufio.NewWriter(conn)
+	//可以自定义其ClientCodec进行更换
 	client := &gobClientCodec{conn, gob.NewDecoder(conn), gob.NewEncoder(encBuf), encBuf}
 	return NewClientWithCodec(client)
 }
@@ -203,6 +214,7 @@ func NewClientWithCodec(codec ClientCodec) *Client {
 		codec:   codec,
 		pending: make(map[uint64]*Call),
 	}
+	//开启协程进行input
 	go client.input()
 	return client
 }
@@ -249,6 +261,7 @@ func DialHTTPPath(network, address, path string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	//HTTP1.0
 	io.WriteString(conn, "CONNECT "+path+" HTTP/1.0\n\n")
 
 	// Require successful HTTP response
@@ -288,6 +301,7 @@ func (client *Client) Close() error {
 	}
 	client.closing = true
 	client.mutex.Unlock()
+	//调用其Codec的Close
 	return client.codec.Close()
 }
 
@@ -312,12 +326,14 @@ func (client *Client) Go(serviceMethod string, args interface{}, reply interface
 		}
 	}
 	call.Done = done
+	//同步调用send函数
 	client.send(call)
 	return call
 }
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
 func (client *Client) Call(serviceMethod string, args interface{}, reply interface{}) error {
+	//invokes实质上还是同步的
 	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
 	return call.Error
 }
