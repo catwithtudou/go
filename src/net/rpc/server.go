@@ -150,6 +150,7 @@ const (
 // because Typeof takes an empty interface value. This is annoying.
 var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 
+//主要表示调用方法信息
 type methodType struct {
 	sync.Mutex // protects counters
 	method     reflect.Method
@@ -158,6 +159,7 @@ type methodType struct {
 	numCalls   uint
 }
 
+//主要表示注册服务信息
 type service struct {
 	name   string                 // name of service
 	rcvr   reflect.Value          // receiver of methods for the service
@@ -188,9 +190,9 @@ type Response struct {
 type Server struct {
 	serviceMap sync.Map   // map[string]*service
 	reqLock    sync.Mutex // protects freeReq
-	freeReq    *Request
+	freeReq    *Request	  // 请求头部信息
 	respLock   sync.Mutex // protects freeResp
-	freeResp   *Response
+	freeResp   *Response  // 返回头部信息
 }
 
 // NewServer returns a new Server.
@@ -233,9 +235,9 @@ func (server *Server) RegisterName(name string, rcvr interface{}) error {
 
 func (server *Server) register(rcvr interface{}, name string, useName bool) error {
 	s := new(service)
-	s.typ = reflect.TypeOf(rcvr)
-	s.rcvr = reflect.ValueOf(rcvr)
-	sname := reflect.Indirect(s.rcvr).Type().Name()
+	s.typ = reflect.TypeOf(rcvr) //eg:*rpc.A
+	s.rcvr = reflect.ValueOf(rcvr) //eg:&A{test}
+	sname := reflect.Indirect(s.rcvr).Type().Name() //eg:A
 	if useName {
 		sname = name
 	}
@@ -244,6 +246,7 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 		log.Print(s)
 		return errors.New(s)
 	}
+	//judge the exported type
 	if !token.IsExported(sname) && !useName {
 		s := "rpc.Register: type " + sname + " is not exported"
 		log.Print(s)
@@ -252,12 +255,14 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 	s.name = sname
 
 	// Install the methods
+	// 注册可行的方法服务
 	s.method = suitableMethods(s.typ, true)
 
 	if len(s.method) == 0 {
 		str := ""
 
 		// To help the user, see if a pointer receiver would work.
+		// 尝试将类型地址中的具体信息即*receiver进行寻找是否有方法可注册
 		method := suitableMethods(reflect.PtrTo(s.typ), false)
 		if len(method) != 0 {
 			str = "rpc.Register: type " + sname + " has no exported methods of suitable type (hint: pass a pointer to value of that type)"
@@ -280,9 +285,10 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 	methods := make(map[string]*methodType)
 	for m := 0; m < typ.NumMethod(); m++ {
 		method := typ.Method(m)
-		mtype := method.Type
-		mname := method.Name
+		mtype := method.Type //eg:func(*rpc.A)
+		mname := method.Name //eg:Fun
 		// Method must be exported.
+		// pkgPath is space when the method is be exported
 		if method.PkgPath != "" {
 			continue
 		}
@@ -340,6 +346,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 // contains an error when it is used.
 var invalidRequest = struct{}{}
 
+//对接收到的返回进行编码后再发送返回
 func (server *Server) sendResponse(sending *sync.Mutex, req *Request, reply interface{}, codec ServerCodec, errmsg string) {
 	resp := server.getResponse()
 	// Encode the response header
@@ -374,6 +381,7 @@ func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, 
 	mtype.Unlock()
 	function := mtype.method.Func
 	// Invoke the method, providing a new value for the reply.
+	// 调用原生反射方法进行invoke
 	returnValues := function.Call([]reflect.Value{s.rcvr, argv, replyv})
 	// The return value for the method is an error.
 	errInter := returnValues[0].Interface()
@@ -385,6 +393,7 @@ func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, 
 	server.freeRequest(req)
 }
 
+//服务端编码协议
 type gobServerCodec struct {
 	rwc    io.ReadWriteCloser
 	dec    *gob.Decoder
@@ -455,6 +464,7 @@ func (server *Server) ServeCodec(codec ServerCodec) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
+		//循环接收请求
 		service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec)
 		if err != nil {
 			if debugLog && err != io.EOF {
@@ -464,6 +474,7 @@ func (server *Server) ServeCodec(codec ServerCodec) {
 				break
 			}
 			// send a response if we actually managed to read a header.
+			// 发送错误信息的返回
 			if req != nil {
 				server.sendResponse(sending, req, invalidRequest, codec, err.Error())
 				server.freeRequest(req)
@@ -471,6 +482,8 @@ func (server *Server) ServeCodec(codec ServerCodec) {
 			continue
 		}
 		wg.Add(1)
+		//异步调用
+		//使用wg保证即使循环结束也需要阻塞直至所有Call调用完成
 		go service.call(server, sending, wg, mtype, req, argv, replyv, codec)
 	}
 	// We've seen that there are no more requests.
@@ -495,6 +508,7 @@ func (server *Server) ServeRequest(codec ServerCodec) error {
 		}
 		return err
 	}
+	//同步调用
 	service.call(server, sending, nil, mtype, req, argv, replyv, codec)
 	return nil
 }
@@ -505,6 +519,7 @@ func (server *Server) getRequest() *Request {
 	if req == nil {
 		req = new(Request)
 	} else {
+		//freeReq保证下次可用的req
 		server.freeReq = req.next
 		*req = Request{}
 	}
@@ -567,7 +582,7 @@ func (server *Server) readRequest(codec ServerCodec) (service *service, mtype *m
 	}
 
 	replyv = reflect.New(mtype.ReplyType.Elem())
-
+	//若返回类型为Slice或Map则需要再反射操作一下
 	switch mtype.ReplyType.Elem().Kind() {
 	case reflect.Map:
 		replyv.Elem().Set(reflect.MakeMap(mtype.ReplyType.Elem()))
@@ -594,6 +609,7 @@ func (server *Server) readRequestHeader(codec ServerCodec) (svc *service, mtype 
 	// we can still recover and move on to the next request.
 	keepReading = true
 
+	//将调用的服务方法名称分解
 	dot := strings.LastIndex(req.ServiceMethod, ".")
 	if dot < 0 {
 		err = errors.New("rpc: service/method request ill-formed: " + req.ServiceMethod)
@@ -622,11 +638,13 @@ func (server *Server) readRequestHeader(codec ServerCodec) (svc *service, mtype 
 // go statement.
 func (server *Server) Accept(lis net.Listener) {
 	for {
+		//同步阻塞进行接收
 		conn, err := lis.Accept()
 		if err != nil {
 			log.Print("rpc.Serve: accept:", err.Error())
 			return
 		}
+		//异步将连接进行初始化
 		go server.ServeConn(conn)
 	}
 }
